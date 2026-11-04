@@ -45,22 +45,45 @@
                     </tr>
 
                     </thead>
-
                     <tbody>
 
                     @foreach($matches as $match)
 
-                        <tr>
+                    <tr>
 
-                            <td>{{ $match['file'] }}</td>
+                        <td>
+                            <img
+                                src="{{ asset('storage/images/'.$match['file']) }}"
+                                alt="Miniatura"
+                                width="120"
+                                class="img-thumbnail">
+                        </td>
 
-                            <td>{{ $match['distance'] }}</td>
+                        <td>
+                            {{ $match['file'] }}
+                        </td>
 
-                            <td>
-                                {{ $match['similarity'] }}%
-                            </td>
+                        <td>
+                            {{ $match['distance'] }}
+                        </td>
 
-                        </tr>
+                        <td>
+
+                            <div class="progress">
+
+                                <div
+                                    class="progress-bar bg-success"
+                                    style="width: {{ $match['similarity'] }}%">
+
+                                    {{ $match['similarity'] }}%
+
+                                </div>
+
+                            </div>
+
+                        </td>
+
+                    </tr>
 
                     @endforeach
 
