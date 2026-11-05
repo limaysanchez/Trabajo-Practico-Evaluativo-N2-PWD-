@@ -4,21 +4,20 @@ namespace App\Http\Controllers;
 
 use App\Http\Requests\CompareImageRequest;
 use App\Http\Requests\RegisterImageRequest;
-use App\Repositories\ImageJsonRepository;
-use App\Services\ImageHashService;
-use App\Services\TemporaryImageService;
+use App\Models\Destino;
+use App\Models\Imagen;
 use Illuminate\Contracts\View\View;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Http\Response;
+use Illuminate\Support\Facades\DB;
 use Intervention\Image\Exceptions\DecoderException;
-use Symfony\Component\HttpFoundation\BinaryFileResponse;
-use Throwable;
 
 /**
  * Coordina el flujo HTTP: comparar una foto y luego registrarla o descartarla.
  *
- * El hash, la persistencia y los archivos temporales viven en sus propias clases.
- * La comparación pendiente se guarda en la sesión para que el navegador no pueda alterarla.
+ * La comparación pendiente, con su foto, se guarda en la sesión para que el navegador no pueda alterarla.
+ * La foto recién llega a la base de datos cuando el usuario la registra.
  */
 class ImageComparisonController extends Controller
 {
@@ -29,49 +28,39 @@ class ImageComparisonController extends Controller
         return view('image-comparison.index');
     }
 
-    public function compare(
-        CompareImageRequest $request,
-        ImageHashService $hashService,
-        ImageJsonRepository $repositorio,
-        TemporaryImageService $temporales,
-    ): RedirectResponse {
-        $temporales->eliminar($request->session()->pull(self::CLAVE_SESION.'.temporal'));
+    public function compare(CompareImageRequest $request): RedirectResponse
+    {
         $request->session()->forget(self::CLAVE_SESION);
-        $temporales->purgarAntiguos();
 
-        $temporal = $temporales->guardar($request->file('image'));
+        $foto = $request->file('image');
+        $contenido = $foto->get();
 
         try {
-            $hashHex = $hashService->calcularHex($temporales->rutaAbsoluta($temporal));
+            $hashHex = Imagen::calcularHash($contenido);
         } catch (DecoderException) {
-            $temporales->eliminar($temporal);
-
             return to_route('image.index')->withErrors(['image' => 'No se pudo leer la imagen. Probá con otro archivo.']);
         }
 
-        $masCercana = $hashService->buscarMasCercana($hashHex, $repositorio->todasLasImagenes());
+        $masCercana = Imagen::buscarMasCercana($hashHex);
 
         $request->session()->put(self::CLAVE_SESION, [
-            'temporal' => $temporal,
+            'foto_base64' => base64_encode($contenido),
+            'mime_type' => $foto->getMimeType(),
             'hash_hex' => $hashHex,
-            'coincide' => $masCercana !== null && $hashService->esCoincidencia($masCercana['distancia']),
+            'coincide' => $masCercana !== null && Imagen::esCoincidencia($masCercana['distancia']),
             'mas_cercana' => $masCercana === null ? null : [
-                'destino_id' => $masCercana['imagen']['destino_id'],
-                'titulo' => $masCercana['imagen']['titulo'] ?? '',
-                'hash_hex' => $masCercana['imagen']['hash_hex'],
+                'destino_id' => $masCercana['imagen']->destino_id,
+                'hash_hex' => $masCercana['imagen']->hash_hex,
                 'distancia' => $masCercana['distancia'],
-                'similitud' => $hashService->similitud($masCercana['distancia']),
+                'similitud' => Imagen::similitud($masCercana['distancia']),
             ],
         ]);
 
         return to_route('image.result');
     }
 
-    public function result(
-        Request $request,
-        ImageJsonRepository $repositorio,
-        TemporaryImageService $temporales,
-    ): View|RedirectResponse {
+    public function result(Request $request): View|RedirectResponse
+    {
         $comparacion = $request->session()->get(self::CLAVE_SESION);
 
         if ($comparacion === null) {
@@ -79,12 +68,11 @@ class ImageComparisonController extends Controller
         }
 
         $destinoCoincidente = $comparacion['coincide']
-            ? $repositorio->buscarDestino($comparacion['mas_cercana']['destino_id'])
+            ? Destino::with('imagenes:id,destino_id,titulo')->find($comparacion['mas_cercana']['destino_id'])
             : null;
 
-        // El JSON pudo cambiar desde la comparación, por ejemplo si se editó a mano.
+        // La base pudo cambiar desde la comparación, por ejemplo si se borró el destino.
         if ($comparacion['coincide'] && $destinoCoincidente === null) {
-            $temporales->eliminar($comparacion['temporal']);
             $request->session()->forget(self::CLAVE_SESION);
 
             return to_route('image.index')->with('error', 'El destino de la comparación ya no existe. Volvé a subir la foto.');
@@ -93,66 +81,44 @@ class ImageComparisonController extends Controller
         return view('image-comparison.result', [
             'comparacion' => $comparacion,
             'destinoCoincidente' => $destinoCoincidente,
-            'destinos' => $repositorio->todosLosDestinos(),
             'umbral' => config('turismo.umbral_hamming'),
         ]);
     }
 
     /**
-     * Muestra la foto temporal, que es privada. Solo sirve la indicada en la sesión.
+     * Sirve una foto guardada en la base de datos.
      */
-    public function temporaryImage(Request $request, TemporaryImageService $temporales): BinaryFileResponse
+    public function show(Imagen $imagen): Response
     {
-        $temporal = $request->session()->get(self::CLAVE_SESION.'.temporal');
-
-        abort_unless($temporal !== null && $temporales->existe($temporal), 404);
-
-        return response()->file($temporales->rutaAbsoluta($temporal));
+        return response($imagen->contenido)->header('Content-Type', $imagen->mime_type);
     }
 
-    public function register(
-        RegisterImageRequest $request,
-        ImageJsonRepository $repositorio,
-        TemporaryImageService $temporales,
-    ): RedirectResponse {
+    public function register(RegisterImageRequest $request): RedirectResponse
+    {
         $comparacion = $request->session()->get(self::CLAVE_SESION);
 
         if ($comparacion === null || $comparacion['coincide']) {
             return to_route('image.index')->with('error', 'No hay ninguna foto pendiente de registro.');
         }
 
-        if (! $temporales->existe($comparacion['temporal'])) {
-            $request->session()->forget(self::CLAVE_SESION);
+        DB::transaction(function () use ($request, $comparacion): void {
+            $destino = Destino::create($request->safe()->except('titulo'));
 
-            return to_route('image.index')->with('error', 'La foto temporal ya no está disponible. Volvé a subirla.');
-        }
+            $destino->imagenes()->create([
+                'titulo' => $request->validated('titulo'),
+                'hash_hex' => $comparacion['hash_hex'],
+                'mime_type' => $comparacion['mime_type'],
+                'contenido' => base64_decode($comparacion['foto_base64']),
+            ]);
+        });
 
-        $datos = $request->validated();
-        $archivo = $temporales->publicar($comparacion['temporal']);
-        $imagen = $repositorio->armarImagen($archivo, $datos['titulo'], $comparacion['hash_hex']);
-
-        try {
-            if ($datos['modo'] === 'existente') {
-                $repositorio->agregarImagen($datos['destino_id'], $imagen);
-            } else {
-                $repositorio->crearDestino($datos, $imagen);
-            }
-        } catch (Throwable $excepcion) {
-            // Sin esto quedaría una foto pública que el JSON no conoce.
-            $temporales->revertirPublicacion($archivo);
-
-            throw $excepcion;
-        }
-
-        $temporales->eliminar($comparacion['temporal']);
         $request->session()->forget(self::CLAVE_SESION);
 
         return to_route('image.index')->with('exito', 'La foto se registró correctamente.');
     }
 
-    public function discard(Request $request, TemporaryImageService $temporales): RedirectResponse
+    public function discard(Request $request): RedirectResponse
     {
-        $temporales->eliminar($request->session()->get(self::CLAVE_SESION.'.temporal'));
         $request->session()->forget(self::CLAVE_SESION);
 
         return to_route('image.index');

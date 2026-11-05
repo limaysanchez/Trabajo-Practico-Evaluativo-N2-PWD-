@@ -12,8 +12,8 @@ Route::post('/compare', [ImageComparisonController::class, 'compare'])
 Route::get('/resultado', [ImageComparisonController::class, 'result'])
     ->name('image.result');
 
-Route::get('/temporal/imagen', [ImageComparisonController::class, 'temporaryImage'])
-    ->name('image.temporary');
+Route::get('/imagenes/{imagen}', [ImageComparisonController::class, 'show'])
+    ->name('image.show');
 
 Route::post('/registrar', [ImageComparisonController::class, 'register'])
     ->name('image.register');
